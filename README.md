@@ -8,6 +8,24 @@ Scope: a working setup path with the parts that are not obvious from the upstrea
 
 ---
 
+## ⚠️ Read this first: never hand an assistant a raw statement
+
+Everything in this repository that involves an AI assistant assumes one thing has already happened: **the document it reads has been sanitized on your machine, with a names file, before it goes anywhere.**
+
+A brokerage statement or trade confirmation carries your legal name, account numbers, address, phone number and sometimes your national identifier. A cloud model does not need any of that to turn a confirmation into a Ghostfolio activity — it needs the symbol, the quantity, the price, the date and the total. Sending the rest is a leak with no upside. And a PDF with black boxes drawn on it is **not** redacted: the text is still in the file.
+
+[`sanitize/`](sanitize/) contains a script that extracts a PDF's text, replaces identifiers with stable pseudonyms (`[ACCT-7f3a]` stays `[ACCT-7f3a]` on every page), throws the PDF container away, and re-scans its own output. The part that matters most is the **names file**: patterns catch account numbers, but only you can tell the script that *Homer Simpson* is you and *Evergreen Terrace* is your street.
+
+```bash
+cp sanitize/pii-names.example.txt .local/pii-names.txt     # then replace every fictional entry with your own
+python sanitize/sanitize_pdf.py confirmation.pdf --names .local/pii-names.txt --strict
+# read confirmation.sanitized.md BEFORE you paste it anywhere
+```
+
+Full instructions, the trust model and what the script cannot do: [`sanitize/README.md`](sanitize/README.md). The same kit ships in the companion [firefly-nas-setup](https://github.com/ANPC86/firefly-nas-setup) repository for bank statements.
+
+---
+
 ## 0. Hardware and platform
 
 Measured on the reference setup, not taken from a spec sheet.
@@ -135,11 +153,24 @@ Publish the container's port like any other service (`ports: ["8444:8001"]` on t
 
 Reading is the easy half. Recording a trade or a dividend the assistant was told about is where an unconstrained tool list goes wrong — first symbol match taken, a fee invented to make a total reconcile, the same dividend written twice. [`agent/`](agent/) packages a bounded procedure for it: resolve from what is held, validate the arithmetic, check for duplicates, show the proposed record, **write only on explicit authorisation**, verify from the record. It ships as a Claude Code sub-agent and skill, and as a system prompt for any other MCP-capable assistant. Setup steps are in [`agent/README.md`](agent/README.md).
 
+The input to that procedure is usually a broker's email or PDF. Run a PDF through [`sanitize/`](sanitize/) first; the procedure resolves the account by its Ghostfolio name, which you supply, so the sanitized text is all the assistant needs.
+
+---
+
+## Support
+
+If this project helps you, sponsorship is appreciated but never required.
+
+<a href="https://www.buymeacoffee.com/ANPCAI" target="_blank">
+  <img src="https://cdn.buymeacoffee.com/buttons/v2/default-blue.png" alt="Buy Me A Coffee" width="180">
+</a>
+
 ---
 
 ## Layout
 
 ```
+sanitize/                              PDF → pseudonymised text, with a names file; READ ITS README FIRST
 compose/ghostfolio/                    Ghostfolio + Postgres + Redis (+ backup) compose stack
 compose/ghostfolio-mcp/                mhajder/ghostfolio-mcp compose stack, one per Ghostfolio user
 fixtures/demo-holdings.json            the sample portfolio's positions and weights

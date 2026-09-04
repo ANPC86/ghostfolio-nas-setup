@@ -1,0 +1,36 @@
+# pii-names.example.txt — copy to .local/pii-names.txt and replace every entry with your own.
+#
+# One term per line. Lines starting with # are ignored. Matching is case-insensitive and
+# tolerant of line-wrapping and non-breaking spaces inside a multi-word term.
+#
+# Every name below is fictional. The real file is PII: keep it in a gitignored folder
+# (.local/ in this repository) and never share it, commit it, or paste it anywhere.
+#
+# What belongs here: anything a stranger could search for that points at you.
+# What does NOT belong here: issuers, tickers, exchanges, merchants — those are the analysis payload.
+
+# --- People: full name, surname alone, and every variant a statement might print ---
+Homer Simpson
+Homer J. Simpson
+SIMPSON HOMER J
+Simpson, Homer
+Simpson
+Marge Simpson
+Bouvier
+
+# --- Household members, joint account holders, beneficiaries ---
+John Smith
+Jane Doe
+
+# --- Employer, clients, advisor's name ---
+Springfield Nuclear Power Plant
+Kwik-E-Mart Franchise Holdings
+Ned Flanders
+
+# --- Street, building, condo names (the house number is caught by the address rule; the name is not) ---
+Evergreen Terrace
+742 Evergreen Terrace
+Springfield Heights Condominium
+
+# --- Anything else that identifies you ---
+Springfield Isotopes Season Ticket Holder
