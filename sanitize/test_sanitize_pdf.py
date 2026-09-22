@@ -190,6 +190,31 @@ def test_a_listed_identifier_shaped_like_a_date_is_redacted():
     assert not san.residuals(out), san.residuals(out)
 
 
+def test_a_listed_number_never_eats_part_of_a_larger_amount():
+    """A listed short number is redacted where it stands alone, never inside an amount.
+
+    Regression from the fix above (2026-09-22): once the names pass ran ahead of
+    protection, a listed "403" turned "$403.00" into "$[NAME-...].00" and
+    "1,403.50" into "1,[NAME-...].50", silently corrupting the analysis payload.
+    An entry that is only a fragment of a larger amount is left alone; one that
+    is the whole amount, or any part of a date, is still redacted, because a
+    leaked birth-date fragment costs more than an over-redacted date.
+    """
+    san = sanitize_pdf.Sanitizer(
+        salt="fixed", detectors=sanitize_pdf.build_detectors(7),
+        names=["403", "October 19"])
+    out = san.scrub("Suite 403. Paid $403.00 and 1,403.50 and 403.25 today. "
+                    "Born October 19, 1990. Renewal November 1, 2025.")
+
+    assert "Suite 403" not in out, f"standalone listed number survived: {out}"
+    assert "$403.00" in out, f"amount fragment was redacted: {out}"
+    assert "1,403.50" in out, f"thousands amount fragment was redacted: {out}"
+    assert "403.25" in out, f"decimal amount fragment was redacted: {out}"
+    assert "October 19" not in out, f"listed fragment of a date survived: {out}"
+    assert "November 1, 2025" in out, f"unlisted date was redacted: {out}"
+    assert not san.residuals(out), f"residual scan must honour the same exception: {san.residuals(out)}"
+
+
 # ---- batches: folders, new-download filters, one bad file, shared tokens -------------------------
 # Synthetic content only. Each document carries the same invented account number so the shared-salt
 # property is visible, plus a phone number the residual scan would catch if it survived.

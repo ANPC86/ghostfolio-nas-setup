@@ -233,9 +233,25 @@ class Sanitizer:
         #    which overrules protection. A birth date on the list was parked as
         #    a date, never seen by this pass, and restored in plaintext
         #    (2026-09-21, an insurance renewal notice).
+        #    One exception, so that an entry never corrupts the analysis
+        #    payload: a match that is only a fragment of a larger AMOUNT is left
+        #    alone (a listed "403" must not turn "$403.00" into "$[NAME].00").
+        #    A match that is the whole amount, or any part of a date, is still
+        #    redacted - a leaked birth-date fragment costs more than an
+        #    over-redacted date (2026-09-22).
         npat = self._name_pattern()
         if npat:
+            amount_spans = [(m.start(), m.end())
+                            for kind, pat in PROTECT if kind == "amount"
+                            for m in pat.finditer(text)]
+
+            def inside_larger_amount(m: re.Match) -> bool:
+                return any(a <= m.start() and m.end() <= b and (b - a) > (m.end() - m.start())
+                           for a, b in amount_spans)
+
             def sub_name(m: re.Match) -> str:
+                if inside_larger_amount(m):
+                    return m.group(0)
                 self.counts["name"] += 1
                 return self.token("NAME", m.group(0))
             text = npat.sub(sub_name, text)
@@ -266,8 +282,17 @@ class Sanitizer:
             if hits:
                 found[det.name] = len(hits)
         npat = self._name_pattern()
-        if npat and (n := len(npat.findall(text))):
-            found["name"] = n
+        if npat:
+            # Same exception as the scrub: a listed entry left inside a larger
+            # amount is not a residual, or --strict would fail every such page.
+            amount_spans = [(m.start(), m.end())
+                            for kind, pat in PROTECT if kind == "amount"
+                            for m in pat.finditer(text)]
+            n = sum(1 for m in npat.finditer(text)
+                    if not any(a <= m.start() and m.end() <= b and (b - a) > (m.end() - m.start())
+                               for a, b in amount_spans))
+            if n:
+                found["name"] = n
         return found
 
 
