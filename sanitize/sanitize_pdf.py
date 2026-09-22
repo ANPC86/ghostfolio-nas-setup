@@ -32,6 +32,20 @@ Usage
     python sanitize/sanitize_pdf.py statement.pdf --names .local/pii-names.txt --strict
     python sanitize/sanitize_pdf.py statement.pdf --dry-run
 
+Batches: pass several PDFs and/or folders. Every document in one run shares a
+salt, so the same account reads as the same token across all of them.
+
+    python sanitize/sanitize_pdf.py statements/ --recursive --skip-existing \
+        --names .local/pii-names.txt --strict
+    python sanitize/sanitize_pdf.py statements/ --recursive --newer-than 2026-09-15T12:40 \
+        --names .local/pii-names.txt --strict
+
+`--skip-existing` skips a PDF whose `.sanitized.md` is already at least as new
+as the PDF, which is how "only the new downloads" is expressed without a date.
+One unreadable or scanned file is reported as FAILED and the batch continues;
+a batch prints a summary table. Exit codes: 0 clean, 1 residual matches under
+`--strict`, 2 any input not found or failed.
+
 Outputs `<input>.sanitized.md` and `<input>.redaction-report.json` next to the
 input unless `--out-dir` says otherwise. `--mapping FILE` additionally writes
 the pseudonym-to-original table; that file contains the very data you are
@@ -48,6 +62,7 @@ import secrets
 import sys
 from collections import Counter
 from dataclasses import dataclass, field
+from datetime import datetime
 from pathlib import Path
 
 # --------------------------------------------------------------------------
@@ -175,7 +190,20 @@ class Sanitizer:
         # patching that after the fact doubles the backslash) and join with
         # \s+, which covers \xa0 and any run of whitespace from wrapping.
         patterns = ["\\s+".join(re.escape(w) for w in p.split()) for p in parts]
-        return re.compile("|".join(patterns), re.I)
+        # Anchor each alternative to a word boundary. Without this the pass is a
+        # plain substring match, and a short given name is a substring of
+        # ordinary words: a list carrying "Lance" turned every "Balance" on an
+        # RBC statement into "Ba[NAME-1a2b]". Lookarounds rather than \b,
+        # because \b is defined relative to whatever sits at the edge of the
+        # pattern and a name may legitimately begin or end with punctuation
+        # (O'Brien, a trailing period), where \b asserts the opposite of what
+        # is wanted. \w excludes U+00A0, so a name wrapped in non-breaking
+        # spaces still matches.
+        # Accepted cost: a name run together with adjacent letters and no
+        # separator at all ("MRLANCEORTEGA") no longer matches. Extraction
+        # keeps name fields separate; the demonstrated failure was the other
+        # direction, and it corrupted the analysable text on every page.
+        return re.compile(rf"(?<!\w)(?:{'|'.join(patterns)})(?!\w)", re.I)
 
     def scrub(self, text: str) -> str:
         holds: dict[str, str] = {}
@@ -184,10 +212,6 @@ class Sanitizer:
             key = f"\x00{len(holds)}\x00"
             holds[key] = m.group(0)
             return key
-
-        # 1. Park amounts and dates so detection cannot reach them.
-        for _kind, pat in PROTECT:
-            text = pat.sub(hold, text)
 
         def run(det: Detector, s_text: str) -> str:
             def sub(m: re.Match) -> str:
@@ -198,13 +222,17 @@ class Sanitizer:
                 return self.token(det.label, s)
             return det.pattern.sub(sub, s_text)
 
-        # 2. Detectors that must beat the names pass (email).
+        # 1. Detectors that must beat the names pass (email).
         for det in self.detectors:
             if det.before_names:
                 text = run(det, text)
 
-        # 3. Named individuals - ahead of the address rule, since a name can
-        #    sit inside an address span.
+        # 2. Named individuals - ahead of the address rule, since a name can
+        #    sit inside an address span, and ahead of step 3's parking: a
+        #    listed entry is the operator saying the value identifies someone,
+        #    which overrules protection. A birth date on the list was parked as
+        #    a date, never seen by this pass, and restored in plaintext
+        #    (2026-09-21, an insurance renewal notice).
         npat = self._name_pattern()
         if npat:
             def sub_name(m: re.Match) -> str:
@@ -212,12 +240,16 @@ class Sanitizer:
                 return self.token("NAME", m.group(0))
             text = npat.sub(sub_name, text)
 
+        # 3. Park amounts and dates so the pattern detectors cannot reach them.
+        for _kind, pat in PROTECT:
+            text = pat.sub(hold, text)
+
         # 4. Remaining structured identifiers, most specific first.
         for det in self.detectors:
             if not det.before_names:
                 text = run(det, text)
 
-        # 4. Restore the parked values.
+        # 5. Restore the parked values.
         for key, original in holds.items():
             text = text.replace(key, original)
         return text
@@ -274,25 +306,132 @@ def describe_source_metadata(pdf: Path) -> dict:
         return {}
 
 
+def parse_newer_than(value: str) -> float:
+    """An ISO date or datetime in local time, as a POSIX timestamp."""
+    try:
+        return datetime.fromisoformat(value).timestamp()
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(f"not an ISO date or datetime: {value!r}") from exc
+
+
+def collect_pdfs(inputs: list[Path], recursive: bool) -> tuple[list[Path], list[Path]]:
+    """Expand files and folders into PDFs, in argument order, without duplicates."""
+    found: list[Path] = []
+    missing: list[Path] = []
+    seen: set[Path] = set()
+    for item in inputs:
+        if item.is_dir():
+            walker = item.rglob("*") if recursive else item.glob("*")
+            candidates = sorted(p for p in walker if p.is_file() and p.suffix.lower() == ".pdf")
+        elif item.is_file():
+            candidates = [item]
+        else:
+            missing.append(item)
+            continue
+        for pdf in candidates:
+            key = pdf.resolve()
+            if key not in seen:
+                seen.add(key)
+                found.append(pdf)
+    return found, missing
+
+
+def sanitize_one(pdf: Path, *, salt: str, names: list[str], min_digits: int,
+                 out_dir: Path, dry_run: bool) -> tuple[dict, dict]:
+    """Sanitize one PDF. Returns a summary row and the pseudonym mapping it produced.
+
+    A failure (encrypted, no extractable text, unreadable) is returned as a row with
+    status "failed" rather than raised, so one bad file never stops a batch.
+    """
+    san = Sanitizer(salt=salt, detectors=build_detectors(min_digits), names=names)
+    source_meta = describe_source_metadata(pdf)
+    try:
+        pages = extract_pages(pdf)
+    except SystemExit as exc:
+        print(f"{pdf.name}: FAILED - {exc}")
+        return {"file": pdf, "status": "failed", "error": str(exc)}, {}
+    except Exception as exc:  # noqa: BLE001 - a malformed PDF must not stop the batch
+        print(f"{pdf.name}: FAILED - {type(exc).__name__}: {exc}")
+        return {"file": pdf, "status": "failed", "error": f"{type(exc).__name__}: {exc}"}, {}
+    if not any(p.strip() for p in pages):
+        msg = ("No extractable text - this is likely a scanned image PDF. "
+               "OCR it locally first; do not send the image to a cloud model.")
+        print(f"{pdf.name}: FAILED - {msg}")
+        return {"file": pdf, "status": "failed", "error": msg}, {}
+
+    out_pages = [san.scrub(p) for p in pages]
+    body = "\n\n".join(f"<!-- page {i} -->\n{p.rstrip()}" for i, p in enumerate(out_pages, 1))
+    # Broker downloads put the account number in the file name, joined by underscores. An underscore is a
+    # word character, so the names pass cannot match inside the raw name: scrub it with each underscore as an
+    # en space (whitespace to the regex, and absent from real file names, so it maps back to "_" exactly).
+    # The output files keep the source stem; only the text written into them is scrubbed.
+    source_name = san.scrub(pdf.stem.replace("_", " ")).replace(" ", "_") + pdf.suffix
+    doc = (f"# Sanitized extract: {source_name}\n\n"
+           f"Identifiers replaced with stable pseudonyms. Amounts, dates and merchant "
+           f"names preserved. Original PDF metadata discarded.\n\n---\n\n{body}\n")
+
+    residual = san.residuals(doc)
+    report = {
+        "source_file": source_name,
+        "source_container": source_meta,
+        "redactions_by_type": dict(sorted(san.counts.items(), key=lambda kv: -kv[1])),
+        "redactions_total": sum(san.counts.values()),
+        "distinct_tokens": len(san.mapping),
+        "names_list_supplied": bool(names),
+        "min_digits": min_digits,
+        "residual_matches": residual,
+        "residual_clean": not residual,
+    }
+
+    out_md = out_dir / f"{pdf.stem}.sanitized.md"
+    if not dry_run:
+        out_dir.mkdir(parents=True, exist_ok=True)
+        out_md.write_text(doc, encoding="utf-8")
+        (out_dir / f"{pdf.stem}.redaction-report.json").write_text(
+            json.dumps(report, indent=2), encoding="utf-8")
+
+    print(f"{pdf.name}: {len(pages)} pages, {report['redactions_total']} redactions "
+          f"({report['distinct_tokens']} distinct)")
+    for k, v in report["redactions_by_type"].items():
+        print(f"  {k:16} {v}")
+    if not names:
+        print("  ! no --names list supplied: personal names are NOT being redacted")
+    if residual:
+        print(f"  ! RESIDUAL MATCHES IN OUTPUT: {residual}")
+    if not dry_run:
+        print(f"  -> {out_md}")
+    print("  Read the output before sharing it. Pattern matching is not a guarantee.")
+
+    row = {"file": pdf, "status": "sanitized", "pages": len(pages),
+           "redactions": report["redactions_total"], "residual": residual}
+    return row, san.mapping
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("pdf", type=Path)
-    ap.add_argument("--out-dir", type=Path, help="default: alongside the input")
+    ap.add_argument("inputs", nargs="+", type=Path, metavar="PDF_OR_FOLDER",
+                    help="one or more PDFs and/or folders of PDFs")
+    ap.add_argument("--recursive", action="store_true",
+                    help="also take PDFs from sub-folders of a folder input")
+    ap.add_argument("--newer-than", type=parse_newer_than, metavar="ISO",
+                    help="only PDFs modified at or after this local date or time, "
+                         "e.g. 2026-09-15 or 2026-09-15T12:40")
+    ap.add_argument("--skip-existing", action="store_true",
+                    help="skip a PDF whose .sanitized.md is already at least as new as the PDF")
+    ap.add_argument("--out-dir", type=Path, help="default: alongside each input")
     ap.add_argument("--names", type=Path,
                     help="file of names/terms to redact, one per line; # comments allowed")
     ap.add_argument("--mapping", type=Path,
-                    help="write pseudonym->original table. CONTAINS PII. Keep it local.")
-    ap.add_argument("--salt", help="reuse a salt so tokens stay stable across documents")
+                    help="write pseudonym->original table for the whole run. CONTAINS PII. Keep it local.")
+    ap.add_argument("--salt", help="reuse a salt so tokens stay stable across runs "
+                                   "(within one run every document already shares a salt)")
     ap.add_argument("--min-digits", type=int, default=7,
                     help="digit runs this long or longer are treated as identifiers (default 7)")
     ap.add_argument("--strict", action="store_true",
-                    help="exit 1 if the residual scan finds anything")
+                    help="exit 1 if the residual scan finds anything in any output")
     ap.add_argument("--dry-run", action="store_true", help="report only; write nothing")
     args = ap.parse_args()
-
-    if not args.pdf.is_file():
-        raise SystemExit(f"not found: {args.pdf}")
 
     names: list[str] = []
     if args.names:
@@ -301,61 +440,64 @@ def main() -> int:
         names = [ln.strip() for ln in args.names.read_text(encoding="utf-8").splitlines()
                  if ln.strip() and not ln.lstrip().startswith("#")]
 
+    pdfs, missing = collect_pdfs(args.inputs, args.recursive)
+    for item in missing:
+        print(f"not found: {item}")
+    if args.newer_than is not None:
+        pdfs = [p for p in pdfs if p.stat().st_mtime >= args.newer_than]
+
+    skipped: list[Path] = []
+    if args.skip_existing:
+        pending = []
+        for pdf in pdfs:
+            existing = (args.out_dir or pdf.parent) / f"{pdf.stem}.sanitized.md"
+            if existing.is_file() and existing.stat().st_mtime >= pdf.stat().st_mtime:
+                skipped.append(pdf)
+            else:
+                pending.append(pdf)
+        pdfs = pending
+
+    if args.out_dir:
+        clashes = sorted(stem for stem, n in Counter(p.stem for p in pdfs).items() if n > 1)
+        if clashes:
+            raise SystemExit(f"--out-dir would overwrite outputs: {clashes} share a file name. "
+                             "Run them separately or drop --out-dir.")
+
     salt = args.salt or secrets.token_hex(8)
-    san = Sanitizer(salt=salt, detectors=build_detectors(args.min_digits), names=names)
+    rows: list[dict] = []
+    mapping: dict = {}
+    for pdf in pdfs:
+        row, doc_mapping = sanitize_one(pdf, salt=salt, names=names, min_digits=args.min_digits,
+                                        out_dir=args.out_dir or pdf.parent, dry_run=args.dry_run)
+        rows.append(row)
+        mapping.update(doc_mapping)
 
-    source_meta = describe_source_metadata(args.pdf)
-    pages = extract_pages(args.pdf)
-    if not any(p.strip() for p in pages):
-        raise SystemExit(
-            "No extractable text - this is likely a scanned image PDF. "
-            "OCR it locally first; do not send the image to a cloud model.")
+    if args.mapping and not args.dry_run and mapping:
+        args.mapping.parent.mkdir(parents=True, exist_ok=True)
+        args.mapping.write_text(json.dumps({"salt": salt, "mapping": mapping}, indent=2),
+                                encoding="utf-8")
+        print(f"-> {args.mapping}  (CONTAINS PII - keep local)")
 
-    out_pages = [san.scrub(p) for p in pages]
-    body = "\n\n".join(f"<!-- page {i} -->\n{p.rstrip()}" for i, p in enumerate(out_pages, 1))
-    doc = (f"# Sanitized extract: {args.pdf.name}\n\n"
-           f"Identifiers replaced with stable pseudonyms. Amounts, dates and merchant "
-           f"names preserved. Original PDF metadata discarded.\n\n---\n\n{body}\n")
+    failed = [r for r in rows if r["status"] == "failed"]
+    with_residual = [r for r in rows if r.get("residual")]
+    if len(rows) + len(skipped) + len(missing) != 1:
+        print(f"\nSummary: {len(rows) - len(failed)} sanitized, {len(skipped)} skipped "
+              f"(already sanitized), {len(failed)} failed, {len(missing)} not found, "
+              f"{len(with_residual)} with residual matches")
+        for r in rows:
+            if r["status"] == "failed":
+                print(f"  FAILED     {r['file']}")
+            else:
+                flag = "RESIDUAL" if r["residual"] else "clean"
+                print(f"  {flag:9}  {r['pages']:>3} pages {r['redactions']:>4} redactions  {r['file']}")
+        for pdf in skipped:
+            print(f"  skipped    {pdf}")
+    if not rows and not skipped and not missing:
+        print("no PDFs matched")
 
-    residual = san.residuals(doc)
-    report = {
-        "source_file": args.pdf.name,
-        "source_container": source_meta,
-        "redactions_by_type": dict(sorted(san.counts.items(), key=lambda kv: -kv[1])),
-        "redactions_total": sum(san.counts.values()),
-        "distinct_tokens": len(san.mapping),
-        "names_list_supplied": bool(names),
-        "min_digits": args.min_digits,
-        "residual_matches": residual,
-        "residual_clean": not residual,
-    }
-
-    out_dir = args.out_dir or args.pdf.parent
-    if not args.dry_run:
-        out_dir.mkdir(parents=True, exist_ok=True)
-        (out_dir / f"{args.pdf.stem}.sanitized.md").write_text(doc, encoding="utf-8")
-        (out_dir / f"{args.pdf.stem}.redaction-report.json").write_text(
-            json.dumps(report, indent=2), encoding="utf-8")
-        if args.mapping:
-            args.mapping.parent.mkdir(parents=True, exist_ok=True)
-            args.mapping.write_text(json.dumps(
-                {"salt": salt, "mapping": san.mapping}, indent=2), encoding="utf-8")
-
-    print(f"{args.pdf.name}: {len(pages)} pages, {report['redactions_total']} redactions "
-          f"({report['distinct_tokens']} distinct)")
-    for k, v in report["redactions_by_type"].items():
-        print(f"  {k:16} {v}")
-    if not names:
-        print("  ! no --names list supplied: personal names are NOT being redacted")
-    if residual:
-        print(f"  ! RESIDUAL MATCHES IN OUTPUT: {residual}")
-    if not args.dry_run:
-        print(f"  -> {out_dir / (args.pdf.stem + '.sanitized.md')}")
-        if args.mapping:
-            print(f"  -> {args.mapping}  (CONTAINS PII - keep local)")
-    print("  Read the output before sharing it. Pattern matching is not a guarantee.")
-
-    return 1 if (args.strict and residual) else 0
+    if missing or failed:
+        return 2
+    return 1 if (args.strict and with_residual) else 0
 
 
 if __name__ == "__main__":
