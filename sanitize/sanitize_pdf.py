@@ -87,6 +87,36 @@ PROTECT = [
 ]
 
 
+def _protect_matches(text: str, kind: str) -> list[re.Match]:
+    """Return the protected spans of one kind in their declared precedence order."""
+    matches: list[re.Match] = []
+    occupied: list[tuple[int, int]] = []
+    for protect_kind, pattern in PROTECT:
+        if protect_kind != kind:
+            continue
+        for match in pattern.finditer(text):
+            if any(a < match.end() and match.start() < b for a, b in occupied):
+                continue
+            matches.append(match)
+            occupied.append((match.start(), match.end()))
+    return matches
+
+
+def _strict_fragment_of_amount(name_match: re.Match, amount_match: re.Match) -> bool:
+    """True only when the listed value is smaller than the amount's numeric core.
+
+    Currency signs, signs and whitespace are wrappers, not evidence that a complete
+    listed numeric value is merely an amount fragment. Thus listed ``403.00`` must
+    redact ``$403.00`` while listed ``403`` inside ``$1,403.50`` is ambiguous.
+    """
+    wrapper = re.match(r"[-+]?\$?\s*", amount_match.group(0))
+    core_start = amount_match.start() + (wrapper.end() if wrapper else 0)
+    core_end = amount_match.end()
+    return (core_start <= name_match.start()
+            and name_match.end() <= core_end
+            and (name_match.start(), name_match.end()) != (core_start, core_end))
+
+
 def _luhn(digits: str) -> bool:
     total, alt = 0, False
     for ch in reversed(digits):
@@ -233,28 +263,50 @@ class Sanitizer:
         #    which overrules protection. A birth date on the list was parked as
         #    a date, never seen by this pass, and restored in plaintext
         #    (2026-09-21, an insurance renewal notice).
-        #    One exception, so that an entry never corrupts the analysis
-        #    payload: a match that is only a fragment of a larger AMOUNT is left
-        #    alone (a listed "403" must not turn "$403.00" into "$[NAME].00").
-        #    A match that is the whole amount, or any part of a date, is still
-        #    redacted - a leaked birth-date fragment costs more than an
-        #    over-redacted date (2026-09-22).
+        #    One exception keeps an amount analysable: a listed value that is a
+        #    strict fragment of the amount's numeric core is preserved. It is
+        #    counted as name_in_amount and residuals() reports it, so --strict
+        #    requires human review instead of declaring a false clean. Currency
+        #    signs, signs and whitespace are wrappers: listed "403.00" redacts
+        #    "$403.00", while listed "403" inside "$1,403.50" is ambiguous.
+        #    Every other overlap consumes the complete protected span. That
+        #    prevents partial names from corrupting an amount and prevents a
+        #    listed month or day from exposing the rest of a protected date to
+        #    the later long-digit detector (2026-09-22 Codex review).
         npat = self._name_pattern()
         if npat:
-            amount_spans = [(m.start(), m.end())
-                            for kind, pat in PROTECT if kind == "amount"
-                            for m in pat.finditer(text)]
+            amount_matches = _protect_matches(text, "amount")
+            date_matches = _protect_matches(text, "date")
+            replacements: list[tuple[int, int, set[int]]] = []
+            ambiguous = 0
+            for index, match in enumerate(npat.finditer(text)):
+                dates = [p for p in date_matches
+                         if p.start() < match.end() and match.start() < p.end()]
+                amounts = [p for p in amount_matches
+                           if p.start() < match.end() and match.start() < p.end()]
+                if dates:
+                    replacements.append((min([match.start()] + [p.start() for p in dates]),
+                                         max([match.end()] + [p.end() for p in dates]), {index}))
+                elif amounts and all(_strict_fragment_of_amount(match, p) for p in amounts):
+                    ambiguous += 1
+                elif amounts:
+                    replacements.append((min([match.start()] + [p.start() for p in amounts]),
+                                         max([match.end()] + [p.end() for p in amounts]), {index}))
+                else:
+                    replacements.append((match.start(), match.end(), {index}))
 
-            def inside_larger_amount(m: re.Match) -> bool:
-                return any(a <= m.start() and m.end() <= b and (b - a) > (m.end() - m.start())
-                           for a, b in amount_spans)
-
-            def sub_name(m: re.Match) -> str:
-                if inside_larger_amount(m):
-                    return m.group(0)
-                self.counts["name"] += 1
-                return self.token("NAME", m.group(0))
-            text = npat.sub(sub_name, text)
+            merged: list[tuple[int, int, set[int]]] = []
+            for start, end, indexes in sorted(replacements):
+                if merged and start < merged[-1][1]:
+                    old_start, old_end, old_indexes = merged[-1]
+                    merged[-1] = (old_start, max(old_end, end), old_indexes | indexes)
+                else:
+                    merged.append((start, end, indexes))
+            for start, end, indexes in reversed(merged):
+                original = text[start:end]
+                text = text[:start] + self.token("NAME", original) + text[end:]
+                self.counts["name"] += len(indexes)
+            self.counts["name_in_amount"] += ambiguous
 
         # 3. Park amounts and dates so the pattern detectors cannot reach them.
         for _kind, pat in PROTECT:
@@ -283,16 +335,16 @@ class Sanitizer:
                 found[det.name] = len(hits)
         npat = self._name_pattern()
         if npat:
-            # Same exception as the scrub: a listed entry left inside a larger
-            # amount is not a residual, or --strict would fail every such page.
-            amount_spans = [(m.start(), m.end())
-                            for kind, pat in PROTECT if kind == "amount"
-                            for m in pat.finditer(text)]
-            n = sum(1 for m in npat.finditer(text)
-                    if not any(a <= m.start() and m.end() <= b and (b - a) > (m.end() - m.start())
-                               for a, b in amount_spans))
-            if n:
-                found["name"] = n
+            amount_matches = _protect_matches(text, "amount")
+            names = list(npat.finditer(text))
+            ambiguous = sum(1 for match in names
+                            if any(_strict_fragment_of_amount(match, amount)
+                                   for amount in amount_matches))
+            missed = len(names) - ambiguous
+            if missed:
+                found["name"] = missed
+            if ambiguous:
+                found["name_in_amount"] = ambiguous
         return found
 
 

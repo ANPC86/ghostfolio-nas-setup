@@ -191,7 +191,7 @@ def test_a_listed_identifier_shaped_like_a_date_is_redacted():
 
 
 def test_a_listed_number_never_eats_part_of_a_larger_amount():
-    """A listed short number is redacted where it stands alone, never inside an amount.
+    """A listed short number is redacted alone and reviewable inside an amount.
 
     Regression from the fix above (2026-09-22): once the names pass ran ahead of
     protection, a listed "403" turned "$403.00" into "$[NAME-...].00" and
@@ -212,7 +212,43 @@ def test_a_listed_number_never_eats_part_of_a_larger_amount():
     assert "403.25" in out, f"decimal amount fragment was redacted: {out}"
     assert "October 19" not in out, f"listed fragment of a date survived: {out}"
     assert "November 1, 2025" in out, f"unlisted date was redacted: {out}"
-    assert not san.residuals(out), f"residual scan must honour the same exception: {san.residuals(out)}"
+    assert san.counts["name_in_amount"] == 3, san.counts
+    assert san.residuals(out) == {"name_in_amount": 3}, san.residuals(out)
+
+
+def test_a_complete_listed_amount_is_redacted_despite_currency_or_whitespace():
+    san = sanitize_pdf.Sanitizer(
+        salt="fixed", detectors=sanitize_pdf.build_detectors(7),
+        names=["403.00", "1,403.50"])
+    out = san.scrub("ID $403.00; alternate: 1,403.50")
+
+    assert "403.00" not in out, out
+    assert "1,403.50" not in out, out
+    assert san.counts["name"] == 2, san.counts
+    assert not san.residuals(out), san.residuals(out)
+
+
+def test_a_partial_name_amount_overlap_redacts_the_whole_overlap():
+    san = sanitize_pdf.Sanitizer(
+        salt="fixed", detectors=sanitize_pdf.build_detectors(7),
+        names=["50 today"])
+    out = san.scrub("Paid 1,403.50 today after approval")
+
+    assert "1,403." not in out, out
+    assert "50 today" not in out, out
+    assert san.counts["name"] == 1, san.counts
+    assert not san.residuals(out), san.residuals(out)
+
+
+def test_a_listed_date_fragment_redacts_the_complete_protected_date():
+    san = sanitize_pdf.Sanitizer(
+        salt="fixed", detectors=sanitize_pdf.build_detectors(4),
+        names=["October"])
+    out = san.scrub("Born October 19, 1990")
+
+    assert "October" not in out and "1990" not in out, out
+    assert san.counts["long_digits"] == 0, san.counts
+    assert not san.residuals(out), san.residuals(out)
 
 
 # ---- batches: folders, new-download filters, one bad file, shared tokens -------------------------
